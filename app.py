@@ -22,7 +22,6 @@ def get_hf_client():
         _HF_CLIENT = InferenceClient(
             model=MODEL_ID,
             token=HF_API_KEY,
-            base_url="https://router.huggingface.co",
             timeout=90
         )
     return _HF_CLIENT
@@ -50,6 +49,7 @@ def hf_summarize(text, max_new_tokens=180, max_retries=5):
             print(f"[HF] error attempt {attempt}/{max_retries}: {e} | retry in {wait}s")
             time.sleep(wait)
     raise RuntimeError(f"HF failed after retries: {last_err}")
+
 
 # ========= DB =========
 def get_db():
