@@ -1,15 +1,55 @@
 import os, re, time, json, sqlite3, requests
 from flask import Flask, request, jsonify, g
+from huggingface_hub import InferenceClient
 
 # ========= ENV =========
-BOT_TOKEN    = os.getenv("BOT_TOKEN")                       # الزامی (از BotFather)
-HF_API_KEY   = os.getenv("HF_API_KEY")                      # الزامی (از HF Settings > Access Tokens)
+BOT_TOKEN    = os.getenv("BOT_TOKEN")                       # الزامی (BotFather)
+HF_API_KEY   = os.getenv("HF_API_KEY")                      # الزامی (HF > Settings > Access Tokens)
 MODEL_ID     = os.getenv("MODEL_ID", "nafisehNik/mt5-persian-summary")
 BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").lower()    # بدون @ (مثال: telegram_summarizer_bot)
-DB_PATH      = os.getenv("DB_PATH", "messages.db")          # مسیر پایگاه‌داده SQLite
+DB_PATH      = os.getenv("DB_PATH", "messages.db")
 
 # ========= FLASK =========
 app = Flask(__name__)
+
+# ========= HF CLIENT (Router) =========
+# از روتر جدید Hugging Face استفاده می‌کنیم
+_HF_CLIENT = None
+def get_hf_client():
+    global _HF_CLIENT
+    if _HF_CLIENT is None:
+        assert HF_API_KEY, "HF_API_KEY missing"
+        _HF_CLIENT = InferenceClient(
+            model=MODEL_ID,
+            token=HF_API_KEY,
+            base_url="https://router.huggingface.co",
+            timeout=90
+        )
+    return _HF_CLIENT
+
+def hf_summarize(text, max_new_tokens=180, max_retries=5):
+    """
+    مدل‌های MT5/T5 باید با text2text صدا زده شوند.
+    prefix 'summarize:' هم کیفیت بهتری می‌دهد.
+    """
+    client = get_hf_client()
+    prompt = f"summarize: {text}"
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            out = client.text2text(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=0.2,
+                do_sample=False,
+            )
+            return (out or "").strip()
+        except Exception as e:
+            last_err = e
+            wait = min(2 ** attempt, 15)
+            print(f"[HF] error attempt {attempt}/{max_retries}: {e} | retry in {wait}s")
+            time.sleep(wait)
+    raise RuntimeError(f"HF failed after retries: {last_err}")
 
 # ========= DB =========
 def get_db():
@@ -74,100 +114,38 @@ def chunk_by_chars(lines, max_chars=3500):
     if buf: chunks.append("\n".join(buf))
     return chunks
 
+def split_message(text, limit=4000):
+    """تقسیم متن بلند به پیام‌های <= 4000 کاراکتری برای تلگرام"""
+    parts = []
+    s = text or ""
+    while len(s) > limit:
+        idx = s.rfind("\n", 0, limit)
+        if idx == -1: idx = limit
+        parts.append(s[:idx])
+        s = s[idx:].lstrip("\n")
+    parts.append(s)
+    return parts
+
 def send_message(chat_id, text, parse_mode=None):
-    if not BOT_TOKEN: 
-        print("[TG] Missing BOT_TOKEN")
-        return
+    if not BOT_TOKEN:
+        print("[TG] Missing BOT_TOKEN"); return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    try:
-        requests.post(url, json=payload, timeout=30)
-    except Exception as e:
-        print("[TG] send_message error:", e)
-
-# ========= HF SUMMARIZER (Router) =========
-# NOTE: api-inference.huggingface.co deprecated → use router.huggingface.co/hf-inference
-def hf_summarize(text, max_new_tokens=180, max_retries=5):
-    assert HF_API_KEY, "HF_API_KEY missing"
-    url = f"https://router.huggingface.co/hf-inference/models/{MODEL_ID}"
-    headers = {
-        "Authorization": f"Bearer {HF_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    # مدل‌های T5/mt5 با پرامپت summarize: نتیجه‌ی بهتری می‌دهند
-    payload = {
-        "inputs": f"summarize: {text}",
-        "parameters": {
-            "max_new_tokens": max_new_tokens,
-            "temperature": 0.2,
-            "do_sample": False
-        },
-        "options": {"wait_for_model": True}
-    }
-
-    last_raw = None
-    for attempt in range(1, max_retries + 1):
-        r = requests.post(url, headers=headers, json=payload, timeout=90)
-        status = r.status_code
-        raw = (r.text or "").strip()
-        last_raw = raw
-
-        body = None
-        if raw:
-            try:
-                body = r.json()
-            except Exception:
-                body = None
-
-        # Success with JSON
-        if status == 200 and body is not None:
-            if isinstance(body, list) and body and isinstance(body[0], dict):
-                return body[0].get("summary_text") or body[0].get("generated_text") or json.dumps(body[0], ensure_ascii=False)
-            if isinstance(body, dict):
-                return body.get("summary_text") or body.get("generated_text") or json.dumps(body, ensure_ascii=False)
-            return str(body)
-
-        # 200 ولی بدنه خالی/غیر JSON → retry
-        if status == 200 and not raw:
-            wait = min(2 ** attempt, 10)
-            print(f"[HF] empty body; retry in {wait}s ({attempt}/{max_retries})")
-            time.sleep(wait); continue
-
-        # مدل مشغول/در حال بارگذاری
-        if status in (503, 529) or (isinstance(body, dict) and body.get("estimated_time")):
-            wait = min(2 ** attempt, 15)
-            print(f"[HF] loading/capacity; retry in {wait}s | body={body or raw[:200]}")
-            time.sleep(wait); continue
-
-        # ریت‌لیمیت
-        if status == 429:
-            wait = min(2 ** attempt, 30)
-            print(f"[HF] rate limited; retry in {wait}s")
-            time.sleep(wait); continue
-
-        # احراز هویت/دسترسی
-        if status in (401, 403):
-            raise RuntimeError(f"HF auth error {status}: {body or raw[:500]}")
-
-        # سایر خطاها
-        raise RuntimeError(f"HF error {status}: {body or raw[:500]}")
-
-    raise RuntimeError(f"HF failed after retries. last_raw={last_raw[:500] if last_raw else 'EMPTY'}")
+    for part in split_message(text, 4000):
+        payload = {"chat_id": chat_id, "text": part}
+        if parse_mode: payload["parse_mode"] = parse_mode
+        try:
+            requests.post(url, json=payload, timeout=30)
+        except Exception as e:
+            print("[TG] send_message error:", e)
 
 def summarize_last_n(chat_id, n):
-    # 1) واکشی آخرین N پیام از همین چت
     texts = fetch_last_texts(chat_id, n)
     if not texts:
         return "هیچ پیامی ذخیره نشده. ربات باید ادمین باشد یا Group Privacy خاموش شود تا پیام‌ها را ببیند."
 
-    # قدیمی→جدید و حذف خالی‌ها
-    texts = list(reversed([t for t in texts if t.strip()]))
-
-    # 2) چانک + خلاصه‌های میانی
+    texts = list(reversed([t for t in texts if t.strip()]))  # قدیمی→جدید
     chunks = chunk_by_chars(texts, max_chars=3500)
+
     partials = []
     for i, ch in enumerate(chunks, 1):
         try:
@@ -175,7 +153,6 @@ def summarize_last_n(chat_id, n):
         except Exception as e:
             partials.append(f"(خطا در خلاصه‌سازی بخش {i}: {e})")
 
-    # 3) Reduce (جمع‌بندی نهایی)
     merged = "\n\n".join(partials)
     try:
         final = hf_summarize(
@@ -201,7 +178,6 @@ def health():
 def webhook():
     data = request.get_json(silent=True) or {}
 
-    # message یا edited_message
     msg = data.get("message") or data.get("edited_message") or {}
     if not msg:
         return "ok", 200
@@ -213,7 +189,7 @@ def webhook():
     from_user = msg.get("from") or {}
     is_bot_sender = from_user.get("is_bot", False)
 
-    # هر پیام متنی از غیر‌بات را ذخیره کن
+    # ذخیره همه پیام‌های متنی (غیر بات‌ها)
     if text and not is_bot_sender and chat_id:
         try:
             save_message_row(
@@ -229,6 +205,18 @@ def webhook():
     if not chat_id or not text:
         return "ok", 200
 
+    # دستورات دیباگ
+    if text.lower().startswith("/ping"):
+        send_message(chat_id, "pong ✅")
+        return "ok", 200
+
+    if text.lower().startswith("/count"):
+        db = get_db()
+        c = db.execute("SELECT COUNT(*) AS c FROM messages WHERE chat_id=?", (str(chat_id),)).fetchone()
+        total = c["c"] if c else 0
+        send_message(chat_id, f"تعداد پیام‌های ذخیره‌شده برای این چت: {total}")
+        return "ok", 200
+
     # PV: /start → راهنما
     if chat_type == "private" and text.startswith("/start"):
         send_message(chat_id,
@@ -236,28 +224,28 @@ def webhook():
                      "Markdown")
         return "ok", 200
 
-    # گروه‌ها: فقط وقتی «واقعاً» دستور داده شد (بدون اسپم)
+    # گروه‌ها: فقط در حالت‌های مجاز پاسخ بده (بدون اسپم)
     if chat_type in ("group", "supergroup"):
-        # /last 500  یا  /last@Bot 500
+        # 1) /last 500  یا  /last@Bot 500
         m = LAST_CMD_RE.match(text)
         if m:
             n = clamp_int(m.group(1), 1, 2000)
             send_message(chat_id, f"در حال خلاصه‌سازی آخرین {n} پیام ...")
             out = summarize_last_n(chat_id, n)
-            send_message(chat_id, out[:4000])
+            send_message(chat_id, out)
             return "ok", 200
 
-        # last 500 @BotName
+        # 2) last 500 @BotName
         if BOT_USERNAME and (f"@{BOT_USERNAME}" in text.lower()):
             m2 = LAST_PLAIN_RE.search(text)
             if m2:
                 n = clamp_int(m2.group(1), 1, 2000)
                 send_message(chat_id, f"در حال خلاصه‌سازی آخرین {n} پیام ...")
                 out = summarize_last_n(chat_id, n)
-                send_message(chat_id, out[:4000])
+                send_message(chat_id, out)
                 return "ok", 200
 
-        # ریپلای به پیامِ خودِ بات و تایپ last 100
+        # 3) ریپلای به پیام خودِ بات و تایپ last 100
         reply = msg.get("reply_to_message") or {}
         reply_from = reply.get("from") or {}
         if reply_from.get("is_bot"):
@@ -266,7 +254,7 @@ def webhook():
                 n = clamp_int(m3.group(1), 1, 2000)
                 send_message(chat_id, f"در حال خلاصه‌سازی آخرین {n} پیام ...")
                 out = summarize_last_n(chat_id, n)
-                send_message(chat_id, out[:4000])
+                send_message(chat_id, out)
                 return "ok", 200
 
         # در غیر این صورت سکوت
@@ -278,7 +266,7 @@ def webhook():
         n = clamp_int(m.group(1), 1, 2000)
         send_message(chat_id, f"در حال خلاصه‌سازی آخرین {n} پیام ...")
         out = summarize_last_n(chat_id, n)
-        send_message(chat_id, out[:4000])
+        send_message(chat_id, out)
         return "ok", 200
 
     # PV: پیام راهنما
