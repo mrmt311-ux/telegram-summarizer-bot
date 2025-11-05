@@ -87,7 +87,7 @@ def send_message(chat_id, text, parse_mode=None):
 # --------- Hugging Face Summarization (robust) ---------
 def hf_summarize(text, max_new_tokens=180, max_retries=5):
     assert HF_API_KEY, "HF_API_KEY missing"
-    url = f"https://api-inference.huggingface.co/models/{MODEL_ID}"
+    url = f"https://router.huggingface.co/hf-inference/models/{MODEL_ID}"
     headers = {"Authorization": f"Bearer {HF_API_KEY}"}
     inp = f"summarize: {text}"
 
@@ -107,22 +107,22 @@ def hf_summarize(text, max_new_tokens=180, max_retries=5):
 
         if status == 200:
             if isinstance(body, list) and body and isinstance(body[0], dict):
-                return body[0].get("summary_text") or body[0].get("generated_text") or json.dumps(body[0], ensure_ascii=False)
+                return body[0].get("summary_text") or body[0].get("generated_text") or str(body[0])
             if isinstance(body, dict):
                 return body.get("summary_text") or body.get("generated_text") or json.dumps(body, ensure_ascii=False)
             return str(body)
 
-        # model cold start / over capacity
         if status in (503, 529) or (isinstance(body, dict) and "estimated_time" in body):
             wait = min(2 ** attempt, 15)
             print(f"[HF] loading/capacity. retry in {wait}s ({attempt}/{max_retries}) | {body}")
-            time.sleep(wait); continue
+            time.sleep(wait)
+            continue
 
-        # rate limited
         if status == 429:
             wait = min(2 ** attempt, 30)
             print(f"[HF] rate limited. retry in {wait}s | {body}")
-            time.sleep(wait); continue
+            time.sleep(wait)
+            continue
 
         if status in (401, 403):
             raise RuntimeError(f"HF auth error {status}: {body}")
@@ -358,7 +358,7 @@ def send_message(chat_id, text, parse_mode=None):
     requests.post(url, json=payload, timeout=30)
 
 def hf_summarize(text):
-    url = f"https://api-inference.huggingface.co/models/{MODEL_ID}"
+    url = f"https://router.huggingface.co/hf-inference/models/{MODEL_ID}"
     headers = {"Authorization": f"Bearer {os.getenv('HF_API_KEY')}"}
     payload = {"inputs": f"summarize: {text}", "options": {"wait_for_model": True}}
     r = requests.post(url, headers=headers, json=payload, timeout=90)
