@@ -19,19 +19,20 @@ KEEP_ALIVE_URL = os.getenv("RENDER_EXTERNAL_URL")
 # ==== Flask ====
 app = Flask(__name__)
 
-# ==== HF Client (آدرس جدید) ====
+# ==== HF Client (آدرس جدید - بدون base_url) ====
 _HF_CLIENT = None
 def get_hf_client():
     global _HF_CLIENT
     if _HF_CLIENT is None:
         assert HF_API_KEY, "HF_API_KEY missing"
         _HF_CLIENT = InferenceClient(
-            model=MODEL_ID,
+            model=f"https://router.huggingface.co/hf-inference/models/{MODEL_ID}",
             token=HF_API_KEY,
-            timeout=120,
-            base_url="https://router.huggingface.co/hf-inference"  # آدرس جدید
+            timeout=120
         )
     return _HF_CLIENT
+
+
 
 def hf_summarize(text, max_new_tokens=180, max_retries=5):
     client = get_hf_client()
