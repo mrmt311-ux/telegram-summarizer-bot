@@ -1,5 +1,5 @@
 # app.py
-import os, re, time, sqlite3, requests, logging
+import os, re, time, sqlite3, requests, logging, threading
 from flask import Flask, request, jsonify, g
 from huggingface_hub import InferenceClient
 
@@ -14,25 +14,30 @@ MODEL_ID     = os.getenv("MODEL_ID", "meta-llama/Meta-Llama-3.1-8B-Instruct")
 BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").lower().lstrip("@")
 DB_PATH      = os.getenv("DB_PATH", "/tmp/messages.db")
 CLEANUP_DAYS = int(os.getenv("CLEANUP_DAYS", "30"))
+KEEP_ALIVE_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # ==== Flask ====
 app = Flask(__name__)
 
-# ==== HF Client ====
+# ==== HF Client (آدرس جدید) ====
 _HF_CLIENT = None
 def get_hf_client():
     global _HF_CLIENT
     if _HF_CLIENT is None:
         assert HF_API_KEY, "HF_API_KEY missing"
-        _HF_CLIENT = InferenceClient(model=MODEL_ID, token=HF_API_KEY, timeout=120)
+        _HF_CLIENT = InferenceClient(
+            model=MODEL_ID,
+            token=HF_API_KEY,
+            timeout=120,
+            base_url="https://router.huggingface.co/hf-inference"  # آدرس جدید
+        )
     return _HF_CLIENT
 
 def hf_summarize(text, max_new_tokens=180, max_retries=5):
     client = get_hf_client()
     text = text.strip()
-
-    # تشخیص نوع مدل
     model_lower = MODEL_ID.lower()
+
     if "t5" in model_lower or "mt5" in model_lower:
         prompt = f"summarize: {text}"
         for attempt in range(1, max_retries + 1):
@@ -53,7 +58,6 @@ def hf_summarize(text, max_new_tokens=180, max_retries=5):
         raise RuntimeError("T5 model failed")
 
     else:
-        # مدل‌های Instruct
         messages = [{"role": "user", "content": f"خلاصه فارسی کن (حداکثر 150 کلمه):\n\n{text}"}]
         for attempt in range(1, max_retries + 1):
             try:
@@ -224,19 +228,36 @@ def summarize_last_n(chat_id, n):
 
     return final
 
+# ==== Keep-Alive ===
+def keep_alive():
+    if not KEEP_ALIVE_URL:
+        return
+    def ping():
+        while True:
+            try:
+                requests.get(KEEP_ALIVE_URL, timeout=10)
+                logger.info("[KEEP-ALIVE] Ping sent")
+            except:
+                pass
+            time.sleep(240)
+    thread = threading.Thread(target=ping, daemon=True)
+    thread.start()
+
 # ==== Routes ====
 @app.route("/", methods=["GET"])
 def health():
     try:
-        db = get_db()
-        db.execute("SELECT 1").fetchone()
+        get_db().execute("SELECT 1").fetchone()
         get_hf_client()
         return jsonify({"ok": True, "db": "connected", "hf": "ready"}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["POST", "GET"])
 def webhook():
+    if request.method == "GET":
+        return "ok", 200  # برای تست دستی
+
     data = request.get_json(silent=True) or {}
     msg = data.get("message") or data.get("edited_message") or {}
     if not msg:
@@ -325,6 +346,8 @@ def webhook():
 
     return "ok", 200
 
+# ==== Run ====
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
+    keep_alive()
     app.run(host="0.0.0.0", port=port, debug=False)
