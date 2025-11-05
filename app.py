@@ -1,3 +1,4 @@
+# app.py
 import os, re, time, sqlite3, requests, logging
 from flask import Flask, request, jsonify, g
 from huggingface_hub import InferenceClient
@@ -9,10 +10,10 @@ logger = logging.getLogger(__name__)
 # ==== ENV ====
 BOT_TOKEN    = os.getenv("BOT_TOKEN")
 HF_API_KEY   = os.getenv("HF_API_KEY")
-MODEL_ID     = os.getenv("MODEL_ID", "nafisehNik/mt5-persian-summary")
+MODEL_ID     = os.getenv("MODEL_ID", "meta-llama/Meta-Llama-3.1-8B-Instruct")
 BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").lower().lstrip("@")
-DB_PATH      = os.getenv("DB_PATH", "messages.db")
-CLEANUP_DAYS = int(os.getenv("CLEANUP_DAYS", "30"))  # پاکسازی پیام‌های قدیمی
+DB_PATH      = os.getenv("DB_PATH", "/tmp/messages.db")
+CLEANUP_DAYS = int(os.getenv("CLEANUP_DAYS", "30"))
 
 # ==== Flask ====
 app = Flask(__name__)
@@ -23,30 +24,51 @@ def get_hf_client():
     global _HF_CLIENT
     if _HF_CLIENT is None:
         assert HF_API_KEY, "HF_API_KEY missing"
-        _HF_CLIENT = InferenceClient(model=MODEL_ID, token=HF_API_KEY, timeout=90)
+        _HF_CLIENT = InferenceClient(model=MODEL_ID, token=HF_API_KEY, timeout=120)
     return _HF_CLIENT
 
 def hf_summarize(text, max_new_tokens=180, max_retries=5):
     client = get_hf_client()
-    prompt = f"summarize: {text.strip()}"
-    last_err = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            out = client.text_generation(
-                prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=0.2,
-                do_sample=False,
-                repetition_penalty=1.1,
-                return_full_text=False,
-            )
-            return (out or "").strip()
-        except Exception as e:
-            last_err = e
-            wait = min(2 ** attempt, 12)
-            logger.warning(f"[HF] attempt {attempt}/{max_retries} failed: {e} | retry in {wait}s")
-            time.sleep(wait)
-    raise RuntimeError(f"HF failed after {max_retries} retries: {last_err}")
+    text = text.strip()
+
+    # تشخیص نوع مدل
+    model_lower = MODEL_ID.lower()
+    if "t5" in model_lower or "mt5" in model_lower:
+        prompt = f"summarize: {text}"
+        for attempt in range(1, max_retries + 1):
+            try:
+                out = client.text_generation(
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.2,
+                    do_sample=False,
+                    repetition_penalty=1.1,
+                    return_full_text=False,
+                )
+                return (out or "").strip()
+            except Exception as e:
+                wait = min(2 ** attempt, 12)
+                logger.warning(f"[HF] T5 attempt {attempt} failed: {e}")
+                time.sleep(wait)
+        raise RuntimeError("T5 model failed")
+
+    else:
+        # مدل‌های Instruct
+        messages = [{"role": "user", "content": f"خلاصه فارسی کن (حداکثر 150 کلمه):\n\n{text}"}]
+        for attempt in range(1, max_retries + 1):
+            try:
+                out = client.chat_completion(
+                    messages,
+                    max_tokens=max_new_tokens,
+                    temperature=0.2,
+                    stream=False,
+                )
+                return out.choices[0].message.content.strip()
+            except Exception as e:
+                wait = min(2 ** attempt, 12)
+                logger.warning(f"[HF] Instruct attempt {attempt} failed: {e}")
+                time.sleep(wait)
+        raise RuntimeError("Instruct model failed")
 
 # ==== DB (SQLite) ====
 def get_db():
@@ -101,7 +123,7 @@ def cleanup_old_messages(days=CLEANUP_DAYS):
         deleted = db.execute("DELETE FROM messages WHERE date < ?", (cutoff,)).rowcount
         db.commit()
         if deleted:
-            logger.info(f"[DB] cleanup: {deleted} old messages deleted (>{days} days)")
+            logger.info(f"[DB] cleanup: {deleted} old messages deleted")
     except Exception as e:
         logger.error(f"[DB] cleanup error: {e}")
 
@@ -154,7 +176,7 @@ def send_message(chat_id, text, parse_mode=None, reply_to_message_id=None):
     parts = split_message(text, 4000)
     for i, part in enumerate(parts):
         if i > 0:
-            time.sleep(0.35)  # Anti-flood
+            time.sleep(0.35)
         if parse_mode == "MarkdownV2":
             part = escape_markdown_v2(part)
         payload = {
@@ -172,10 +194,10 @@ def send_message(chat_id, text, parse_mode=None, reply_to_message_id=None):
             logger.error(f"[TG] send_message error: {e}")
 
 def summarize_last_n(chat_id, n):
-    cleanup_old_messages()  # هر بار قبل از خلاصه
+    cleanup_old_messages()
     texts = fetch_last_texts(chat_id, n)
     if not texts:
-        return "هیچ پیامی ذخیره نشده.\n\n⚠ برای گروه: ربات را **Admin** کنید و **Group Privacy** را خاموش کنید."
+        return "هیچ پیامی ذخیره نشده.\n\nبرای گروه: ربات را **Admin** کنید."
 
     texts = list(reversed([t for t in texts if t.strip()]))
     chunks = chunk_by_chars(texts, max_chars=3500)
@@ -191,14 +213,13 @@ def summarize_last_n(chat_id, n):
     merged = "\n\n".join(partials)
     try:
         final_prompt = (
-            "این خلاصه‌های میانی را به یک خلاصه تمیز و حرفه‌ای تبدیل کن:\n"
+            "خلاصه‌های زیر را به یک خلاصه حرفه‌ای تبدیل کن:\n"
             "- TL;DR (۳–۵ خط)\n"
-            "- نکات کلیدی با بولت‌پوینت\n"
-            "- تصمیم‌ها و اکشن‌ها (اگر وجود داشت)\n\n" + merged
+            "- نکات کلیدی\n"
+            "- تصمیم‌ها\n\n" + merged
         )
         final = hf_summarize(final_prompt, max_new_tokens=250)
-    except Exception as e:
-        logger.warning(f"Final merge failed: {e}")
+    except Exception:
         final = "\n\n".join(partials)
 
     return final
@@ -210,14 +231,7 @@ def health():
         db = get_db()
         db.execute("SELECT 1").fetchone()
         get_hf_client()
-        return jsonify({
-            "ok": True,
-            "bot_token_set": bool(BOT_TOKEN),
-            "hf_api_key_set": bool(HF_API_KEY),
-            "model": MODEL_ID,
-            "db": "connected",
-            "hf": "ready"
-        }), 200
+        return jsonify({"ok": True, "db": "connected", "hf": "ready"}), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
@@ -237,19 +251,14 @@ def webhook():
     message_id = msg.get("message_id")
     date_ts = int(msg.get("date") or 0)
 
-    # ذخیره پیام (حتی ویرایش‌شده)
     if text and not is_bot_sender and chat_id:
-        try:
-            save_message_row(chat_id, message_id, from_user.get("id"), date_ts, text)
-        except Exception as e:
-            logger.error(f"[DB] save failed: {e}")
+        save_message_row(chat_id, message_id, from_user.get("id"), date_ts, text)
 
     if not chat_id or not text:
         return "ok", 200
 
-    # دستورات دیباگ
     if text.lower().startswith("/ping"):
-        send_message(chat_id, "pong", parse_mode="MarkdownV2")
+        send_message(chat_id, "pong", "MarkdownV2")
         return "ok", 200
 
     if text.lower().startswith("/count"):
@@ -259,73 +268,60 @@ def webhook():
         send_message(chat_id, f"*پیام‌های ذخیره‌شده:* `{total}`", "MarkdownV2")
         return "ok", 200
 
-    # PV: /start
     if chat_type == "private" and text.startswith("/start"):
-        send_message(chat_id, (
-            "*ربات خلاصه‌ساز پیام‌های گروه و چت خصوصی*\n\n"
-            "برای خلاصه‌سازی بنویس:\n"
-            "`/last 200` یا `last 200`\n\n"
-            "در گروه: ربات باید **Admin** باشد."
-        ), "MarkdownV2")
+        send_message(chat_id, "*ربات خلاصه‌ساز*\n\n`/last 200`", "MarkdownV2")
         return "ok", 200
 
-    # دستور /clear (فقط PV)
     if chat_type == "private" and CLEAR_RE.match(text):
         db = get_db()
         db.execute("DELETE FROM messages WHERE chat_id=?", (str(chat_id),))
         db.commit()
-        send_message(chat_id, "تاریخچه چت پاک شد.", parse_mode="MarkdownV2")
+        send_message(chat_id, "تاریخچه پاک شد.", "MarkdownV2")
         return "ok", 200
 
-    # گروه: فقط دستورات
     if chat_type in ("group", "supergroup"):
         reply = msg.get("reply_to_message") or {}
         reply_from = reply.get("from") or {}
         is_reply_to_bot = reply_from.get("is_bot", False)
 
-        # 1. /last 500
         m = LAST_CMD_RE.match(text)
         if m:
             n = clamp_int(m.group(1), 1, 2000)
-            send_message(chat_id, f"در حال خلاصه‌سازی آخرین *{n}* پیام...", "MarkdownV2")
+            send_message(chat_id, f"در حال خلاصه‌سازی *{n}* پیام...", "MarkdownV2")
             summary = summarize_last_n(chat_id, n)
             send_message(chat_id, summary, "MarkdownV2")
             return "ok", 200
 
-        # 2. last 500 @BotName
         if BOT_USERNAME and f"@{BOT_USERNAME}" in text.lower():
             m2 = LAST_PLAIN_RE.search(text)
             if m2:
                 n = clamp_int(m2.group(1), 1, 2000)
-                send_message(chat_id, f"در حال خلاصه‌سازی آخرین *{n}* پیام...", "MarkdownV2")
+                send_message(chat_id, f"در حال خلاصه‌سازی *{n}* پیام...", "MarkdownV2")
                 summary = summarize_last_n(chat_id, n)
                 send_message(chat_id, summary, "MarkdownV2")
                 return "ok", 200
 
-        # 3. ریپلای به پیام بات + last N
         if is_reply_to_bot:
             m3 = LAST_PLAIN_RE.search(text)
             if m3:
                 n = clamp_int(m3.group(1), 1, 2000)
-                send_message(chat_id, f"در حال خلاصه‌سازی آخرین *{n}* پیام...", "MarkdownV2")
+                send_message(chat_id, f"در حال خلاصه‌سازی *{n}* پیام...", "MarkdownV2")
                 summary = summarize_last_n(chat_id, n)
                 send_message(chat_id, summary, "MarkdownV2", reply_to_message_id=message_id)
                 return "ok", 200
 
         return "ok", 200
 
-    # PV: دستورات
     m = LAST_CMD_RE.match(text) or LAST_PLAIN_RE.match(text)
     if m:
         n = clamp_int(m.group(1), 1, 2000)
-        send_message(chat_id, f"در حال خلاصه‌سازی آخرین *{n}* پیام...", "MarkdownV2")
+        send_message(chat_id, f"در حال خلاصه‌سازی *{n}* پیام...", "MarkdownV2")
         summary = summarize_last_n(chat_id, n)
         send_message(chat_id, summary, "MarkdownV2")
         return "ok", 200
 
-    # راهنما در PV
     if chat_type == "private":
-        send_message(chat_id, "برای خلاصه‌سازی بنویس:\n`/last 200`", "MarkdownV2")
+        send_message(chat_id, "بنویس: `/last 200`", "MarkdownV2")
 
     return "ok", 200
 
